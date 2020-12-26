@@ -11,7 +11,8 @@ import {
     extend,
     broadcastToMessageBus,
     broadcastConnectionErrorMessage,
-    cleanName
+    cleanName,
+    getIntros
 } from '../helpers';
 import {
     reportPlaybackProgress,
@@ -23,6 +24,7 @@ import {
 } from './jellyfinActions';
 import { getDeviceProfile } from './deviceprofileBuilder';
 import { JellyfinApi } from './jellyfinApi';
+import { JfQueue, JfQueueItem } from './jfQueue';
 import { playbackManager } from './playbackManager';
 import { CommandHandler } from './commandHandler';
 import { getMaxBitrateSupport } from './codecSupportHelper';
@@ -41,6 +43,8 @@ const playbackMgr = new playbackManager(window.mediaManager);
 CommandHandler.configure(window.mediaManager, playbackMgr);
 
 resetPlaybackScope($scope);
+
+const queue = JfQueue.getInstance();
 
 const mgr = window.mediaManager;
 
@@ -466,6 +470,79 @@ window.castReceiverContext.addCustomMessageListener(
     }
 );
 
+// Resolve one item before playback
+async function itemToQueueable(
+    item: BaseItemDto,
+    startTicks = 0,
+    mediaSourceId: string | null = null,
+    audioStreamIndex: number | null = null,
+    subtitleStreamIndex: number | null = null,
+    liveStreamId: string | null = null
+): Promise<JfQueueItem> {
+    // Actually resolve the item for an url
+    // await lookupthingy
+
+    const qitem = new JfQueueItem(item.Id ?? '', item.url);
+    if (startTicks) {
+        qitem.startPositionTicks = startTicks;
+    }
+    if (mediaSourceId) qitem.mediaSourceId = mediaSourceId;
+    if (audioStreamIndex) qitem.audioStreamIndex = audioStreamIndex;
+    if (subtitleStreamIndex) qitem.subtitleStreamIndex = subtitleStreamIndex;
+    if (liveStreamId) qitem.liveStreamId = liveStreamId;
+    // also Items/+item.Id is called to get `data`, to pass to playItemInternal
+    // this info needs to be put in qitem as well, because it's essential to get
+    // it playing.
+
+    return qitem;
+}
+
+// resolve multiple items before playback
+// xref playbackManager.playFromOptions
+// TODO: The any type needs away.
+// This type seems to come from, in web, createStreamInfo
+async function itemsToQueueable(options: PlayRequest): Promise<JfQueueItem[]> {
+    const maxBitrate = await getMaxBitrate();
+    const deviceProfile = getDeviceProfile({
+        enableHls: true,
+        bitrateSetting: maxBitrate
+    });
+
+    let first = true;
+
+    const qitems: JfQueueItem[] = [];
+    for (const item of options.items) {
+        if (
+            item.MediaType === 'Video' &&
+            (!first || options.startPositionTicks == 0)
+        ) {
+            // add intros before video items where we are not resuming.
+            for (const intro of (await getIntros(item)).Items ?? []) {
+                qitems.push(await itemToQueueable(intro));
+            }
+        }
+        if (first) {
+            qitems.push(
+                await itemToQueueable(
+                    item,
+                    options.startPositionTicks,
+                    options.mediaSourceId,
+                    options.audioStreamIndex,
+                    options.subtitleStreamIndex,
+                    options.liveStreamId
+                )
+            );
+        } else {
+            qitems.push(await itemToQueueable(item));
+        }
+
+        // not first item
+        first = false;
+    }
+
+    return qitems;
+}
+
 export function translateItems(
     data: any,
     options: PlayRequest,
@@ -476,17 +553,16 @@ export function translateItems(
         function (result: BaseItemDtoQueryResult) {
             if (result.Items) options.items = result.Items;
 
-            if (method == 'PlayNext' || method == 'PlayLast') {
-                for (
-                    let i = 0, length = options.items.length;
-                    i < length;
-                    i++
-                ) {
-                    window.playlist.push(options.items[i]);
+            itemsToQueueable(options).then(function (qitems: JfQueueItem[]) {
+                if (method == 'PlayNext' || method == 'PlayLast') {
+                    queue.enqueue(qitems);
+                    // TODO: start if not started
+                } else {
+                    queue.replace(qitems);
+                    // TODO: then have the playbackmanager restart playback
+                    // guess new load() will do
                 }
-            } else {
-                playbackMgr.playFromOptions(data.options);
-            }
+            });
         }
     );
 }
@@ -513,6 +589,10 @@ export function shuffle(
     });
 }
 
+// MYTERY METHOD! We already have an item, BUT
+// we're going to look up that item again and
+// OR the items together!
+// Maybe they are all the same?!?!
 export function onStopPlayerBeforePlaybackDone(
     item: BaseItemDto,
     options: any
@@ -522,6 +602,8 @@ export function onStopPlayerBeforePlaybackDone(
         type: 'GET'
     }).then(function (data) {
         // Attach the custom properties we created like userId, serverAddress, itemId, etc
+        console.log('original item', item);
+        console.log('new item', data);
         extend(data, item);
 
         playbackMgr.playItemInternal(data, options);
@@ -778,6 +860,8 @@ options.playbackConfig = new cast.framework.PlaybackConfig();
 // media content buffered. Default is 10.
 options.playbackConfig.autoResumeDuration = 5;
 options.supportedCommands = cast.framework.messages.Command.ALL_BASIC_MEDIA;
+// Load our queue implementation
+options.queue = queue;
 
 console.log('Application is ready, starting system');
 window.castReceiverContext.start(options);
